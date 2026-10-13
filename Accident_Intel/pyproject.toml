@@ -1,0 +1,43 @@
+[project]
+name = "accident-intel"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "mahmoud-khaled23", email = "mahmoudkhaled1116@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "aiofiles>=25.1.0",
+    "attr==0.3.2",
+    "chromadb==1.5.9",
+    "colorama==0.4.6",
+    "configparser==7.2.0",
+    "cryptography==50.0.2",
+    "cython>=3.3.0",
+    "docutils==0.23",
+    "fastapi>=0.143.0",
+    "filelock==4.0.8",
+    "htmlparser==0.0.2",
+    "ipython==8.12.3",
+    "ipywidgets==8.1.9",
+    "keyring==25.7.0",
+    "pillow==12.3.0",
+    "protobuf==7.36.2",
+    "pydantic-settings>=2.15.0",
+    "pyopenssl==26.4.0",
+    "python-multipart>=0.0.32",
+    "redis==8.1.0",
+    "sentence-transformers==6.1.0",
+    "thread==2.0.6",
+    "urllib3-secure-extra==0.1.0",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[project.scripts]
+accident-intel = "accident_intel:main"
+
+
+[build-system]
+requires = ["uv_build>=0.12.10,<0.13.0"]
+build-backend = "uv_build"

@@ -1,0 +1,199 @@
+"""Vehicle detection and tracking (YOLO11x + BoT-SORT + Supervision).
+
+Heavy libraries (ultralytics, supervision) are imported lazily inside
+``process_video`` so that importing this module is cheap and never
+triggers a model download.
+"""
+
+import json
+from pathlib import Path
+
+import cv2
+
+DEFAULT_MODEL_PATH = "yolo11x.pt"
+VEHICLE_CLASSES = [2, 3, 5, 7]  # car, motorcycle, bus, truck (COCO ids)
+IMGSZ = 1024
+CONF = 0.25
+IOU = 0.5
+TRACKER = "botsort.yaml"
+
+
+def process_video(
+    input_path,
+    output_video,
+    output_json,
+    model_path=DEFAULT_MODEL_PATH,
+    model=None,
+    min_track_frames=6,
+):
+    """Detect and track vehicles in a video.
+
+    Saves an annotated video (boxes, class labels, track IDs, traces) and a
+    trajectories JSON file.
+
+    Args:
+        input_path: Path to the input video.
+        output_video: Path of the annotated output video (.mp4).
+        output_json: Path of the trajectories JSON file.
+        model_path: YOLO weights to load (ignored if ``model`` is given).
+        model: Optional pre-loaded ``YOLO`` instance, to reuse across videos.
+            Note: tracker state persists inside the model, so use a fresh
+            model (or ``model=None``) for each independent video.
+
+    Returns:
+        dict: The trajectories, in the same structure that is written to JSON.
+
+    Raises:
+        FileNotFoundError: If the input video does not exist.
+        RuntimeError: If the video cannot be opened or the writer fails.
+        ValueError: If the video metadata (fps / width / height) is invalid.
+    """
+    input_path = Path(input_path)
+    output_video = Path(output_video)
+    output_json = Path(output_json)
+
+    if not input_path.is_file():
+        raise FileNotFoundError(f"Input video not found: {input_path}")
+
+    import supervision as sv
+    from ultralytics import YOLO
+
+    cap = cv2.VideoCapture(str(input_path))
+    out = None
+    trajectories = {}
+
+    try:
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not open video: {input_path}")
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        if not fps > 0 or width <= 0 or height <= 0:
+            raise ValueError(
+                f"Invalid video metadata: fps={fps}, width={width}, height={height}"
+            )
+
+        if model is None:
+            model = YOLO(model_path)
+
+        output_video.parent.mkdir(parents=True, exist_ok=True)
+        out = cv2.VideoWriter(
+            str(output_video),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            fps,
+            (width, height),
+        )
+        if not out.isOpened():
+            raise RuntimeError(f"Could not create output video: {output_video}")
+
+        # Adaptive scaling for crisp, high-contrast VLM readability
+        scale = max(0.6, min(1.3, width / 1920.0 * 0.9))
+        box_thickness = max(2, int(scale * 3))
+        text_scale = max(0.55, scale * 0.85)
+        text_thickness = max(1, int(scale * 2))
+
+        box_annotator = sv.BoxAnnotator(thickness=box_thickness)
+        label_annotator = sv.LabelAnnotator(
+            text_scale=text_scale,
+            text_thickness=text_thickness,
+            text_padding=int(scale * 8),
+        )
+        trace_annotator = sv.TraceAnnotator(trace_length=60, thickness=box_thickness)
+
+        frame_idx = 0
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            results = model.track(
+                frame,
+                imgsz=IMGSZ,
+                persist=True,
+                tracker=TRACKER,
+                conf=CONF,
+                iou=IOU,
+                classes=VEHICLE_CLASSES,
+                verbose=False,
+            )
+
+            result = results[0]
+            detections = sv.Detections.from_ultralytics(result)
+
+            if result.boxes.id is not None:
+                track_ids = result.boxes.id.int().cpu().tolist()
+
+                for box, track_id in zip(result.boxes, track_ids):
+                    x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().tolist())
+                    cls = int(box.cls[0])
+                    conf = float(box.conf[0]) if box.conf is not None else None
+
+                    cx = (x1 + x2) / 2
+                    cy = (y1 + y2) / 2
+
+                    if track_id not in trajectories:
+                        trajectories[track_id] = {
+                            "class": model.names[cls],
+                            "trajectory": {},
+                        }
+
+                    trajectories[track_id]["trajectory"][str(frame_idx)] = {
+                        "center": [cx, cy],
+                        "box": [x1, y1, x2, y2],
+                        "conf": conf,
+                    }
+
+            annotated_frame = frame.copy()
+            if len(detections) > 0:
+                has_tracker = (
+                    detections.tracker_id is not None
+                    and len(detections.tracker_id) == len(detections)
+                )
+
+                labels = []
+                for idx in range(len(detections)):
+                    cls_id = int(detections.class_id[idx])
+                    cls_name = (
+                        model.names[cls_id]
+                        if hasattr(model, "names") and cls_id in model.names
+                        else f"class_{cls_id}"
+                    )
+                    if has_tracker and detections.tracker_id[idx] is not None:
+                        labels.append(f"{cls_name} ID:{detections.tracker_id[idx]}")
+                    else:
+                        labels.append(cls_name)
+
+                # Traces need valid tracker IDs
+                if has_tracker:
+                    annotated_frame = trace_annotator.annotate(
+                        scene=annotated_frame, detections=detections
+                    )
+                annotated_frame = box_annotator.annotate(
+                    scene=annotated_frame, detections=detections
+                )
+                annotated_frame = label_annotator.annotate(
+                    scene=annotated_frame, detections=detections, labels=labels
+                )
+
+            out.write(annotated_frame)
+            frame_idx += 1
+    finally:
+        cap.release()
+        if out is not None:
+            out.release()
+
+    if min_track_frames > 1:
+        trajectories = {
+            tid: data
+            for tid, data in trajectories.items()
+            if len(data.get("trajectory", {})) >= min_track_frames
+        }
+
+    output_json.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_json, "w", encoding="utf-8") as f:
+        json.dump(trajectories, f, indent=4)
+
+    return trajectories
